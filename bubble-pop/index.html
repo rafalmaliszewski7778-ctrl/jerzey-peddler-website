@@ -1,0 +1,1234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Bubble Pop">
+<meta name="theme-color" content="#7b5cff">
+<meta name="robots" content="noindex">
+<title>Bubble Pop</title>
+<link rel="apple-touch-icon" id="touchIcon" href="">
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#b9a6ff;
+    touch-action:none;-webkit-user-select:none;user-select:none;
+    -webkit-touch-callout:none;-webkit-tap-highlight-color:transparent;overscroll-behavior:none}
+  canvas{display:block;position:fixed;left:0;top:0;width:100vw;height:100vh;height:100dvh}
+  #sa{position:fixed;left:0;top:0;visibility:hidden;pointer-events:none;
+    padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="sa"></div>
+<script>
+'use strict';
+/* ============================================================
+   Bubble Pop - a toddler bubble game. Five themed worlds.
+   All art is drawn in code, all music/SFX synthesized live.
+   ============================================================ */
+const TAU = Math.PI * 2;
+const rnd = (a, b) => a + Math.random() * (b - a);
+const pick = a => a[(Math.random() * a.length) | 0];
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
+const arr = (n, fn) => Array.from({length: n}, (_, i) => fn(i));
+const FONT = '"Chalkboard SE","Comic Sans MS","Marker Felt","Arial Rounded MT Bold",sans-serif';
+
+const cv = document.getElementById('c');
+let g = cv.getContext('2d');
+let W = 0, H = 0, S = 1, DPR = 1;
+const safe = {t: 0, r: 0, b: 0, l: 0};
+
+/* ---------------- AUDIO ---------------- */
+const AC = window.AudioContext || window.webkitAudioContext;
+let ac = null, master, musicBus, sfxBus, noiseBuf;
+let muted = false;
+try { muted = localStorage.getItem('bp_muted') === '1'; } catch (e) {}
+
+function makeImpulse(sec) {
+  const len = ac.sampleRate * sec, b = ac.createBuffer(2, len, ac.sampleRate);
+  for (let c = 0; c < 2; c++) {
+    const d = b.getChannelData(c);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3);
+  }
+  return b;
+}
+function initAudio() {
+  if (ac) { if (ac.state !== 'running') ac.resume(); return; }
+  if (!AC) return;
+  try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+  ac = new AC();
+  master = ac.createGain(); master.gain.value = muted ? 0 : 0.9;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 4;
+  master.connect(comp); comp.connect(ac.destination);
+  musicBus = ac.createGain(); musicBus.gain.value = 0.3;
+  sfxBus = ac.createGain(); sfxBus.gain.value = 0.75;
+  const rev = ac.createConvolver(); rev.buffer = makeImpulse(2.2);
+  const rvg = ac.createGain(); rvg.gain.value = 0.3;
+  rev.connect(rvg); rvg.connect(master);
+  musicBus.connect(master); sfxBus.connect(master);
+  musicBus.connect(rev); sfxBus.connect(rev);
+  noiseBuf = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate);
+  const nd = noiseBuf.getChannelData(0);
+  for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+  const s = ac.createBufferSource(); s.buffer = ac.createBuffer(1, 1, 22050);
+  s.connect(ac.destination); s.start(0);
+}
+function osc(bus, type, f, t, vol, a, dec, o = {}) {
+  const os = ac.createOscillator(); os.type = type;
+  os.frequency.setValueAtTime(f, t);
+  if (o.glide) os.frequency.exponentialRampToValueAtTime(o.glide, t + (o.glideT || dec));
+  const gn = ac.createGain();
+  gn.gain.setValueAtTime(0.0001, t);
+  gn.gain.exponentialRampToValueAtTime(vol, t + a);
+  gn.gain.exponentialRampToValueAtTime(0.0001, t + a + dec);
+  let node = os;
+  if (o.lp) {
+    const fl = ac.createBiquadFilter(); fl.type = 'lowpass';
+    fl.frequency.setValueAtTime(Math.min(o.lp, 18000), t);
+    if (o.lpEnd) fl.frequency.exponentialRampToValueAtTime(o.lpEnd, t + a + dec);
+    os.connect(fl); node = fl;
+  }
+  node.connect(gn); gn.connect(bus);
+  if (o.vib) {
+    const l = ac.createOscillator(); l.frequency.value = o.vib;
+    const lg = ac.createGain(); lg.gain.value = o.vibAmt || 6;
+    l.connect(lg); lg.connect(os.frequency); l.start(t); l.stop(t + a + dec + 0.05);
+  }
+  os.start(t); os.stop(t + a + dec + 0.05);
+}
+function noise(bus, t, vol, dec, type, freq, q, o = {}) {
+  const s = ac.createBufferSource(); s.buffer = noiseBuf;
+  const f = ac.createBiquadFilter(); f.type = type; f.Q.value = q || 1;
+  f.frequency.setValueAtTime(freq, t);
+  if (o.fEnd) f.frequency.exponentialRampToValueAtTime(o.fEnd, t + dec);
+  const gn = ac.createGain(), a = o.a || 0.003;
+  gn.gain.setValueAtTime(0.0001, t);
+  gn.gain.exponentialRampToValueAtTime(vol, t + a);
+  gn.gain.exponentialRampToValueAtTime(0.0001, t + a + dec);
+  s.connect(f); f.connect(gn); gn.connect(bus);
+  s.start(t, Math.random() * 1.5); s.stop(t + a + dec + 0.1);
+}
+const INST = {
+  bell(f, t, v, b) { osc(b, 'sine', f, t, v, 0.004, 1.4); osc(b, 'sine', f * 2, t, v * 0.3, 0.004, 0.5); osc(b, 'sine', f * 3.01, t, v * 0.12, 0.003, 0.25); },
+  box(f, t, v, b) { osc(b, 'sine', f, t, v, 0.003, 0.9); osc(b, 'triangle', f * 2, t, v * 0.18, 0.003, 0.3); },
+  pad(f, t, v, b) { osc(b, 'triangle', f, t, v, 0.5, 2.6, {lp: 1200}); osc(b, 'sine', f * 1.004, t, v * 0.6, 0.6, 2.6); },
+  pluck(f, t, v, b) { osc(b, 'triangle', f, t, v, 0.003, 0.45, {lp: f * 8, lpEnd: f * 1.5}); osc(b, 'sawtooth', f, t, v * 0.25, 0.003, 0.25, {lp: f * 5, lpEnd: f}); },
+  uke(f, t, v, b) { osc(b, 'triangle', f, t, v, 0.002, 0.32, {lp: f * 10, lpEnd: f * 2}); osc(b, 'square', f, t, v * 0.07, 0.002, 0.12, {lp: f * 4}); },
+  marimba(f, t, v, b) { osc(b, 'sine', f, t, v, 0.003, 0.5); osc(b, 'sine', f * 4, t, v * 0.25, 0.002, 0.07); },
+  xylo(f, t, v, b) { osc(b, 'sine', f, t, v, 0.002, 0.32); osc(b, 'sine', f * 3, t, v * 0.35, 0.002, 0.06); },
+  steel(f, t, v, b) { osc(b, 'sine', f, t, v, 0.006, 0.9); osc(b, 'sine', f * 2, t, v * 0.35, 0.006, 0.5); osc(b, 'sine', f * 3.02, t, v * 0.15, 0.004, 0.25); },
+  brass(f, t, v, b) { osc(b, 'sawtooth', f, t, v * 0.6, 0.03, 0.32, {lp: f * 3.5, lpEnd: f * 1.6, vib: 5.5, vibAmt: f * 0.012}); osc(b, 'sawtooth', f * 1.004, t, v * 0.4, 0.04, 0.3, {lp: f * 3}); },
+  bass(f, t, v, b) { osc(b, 'triangle', f, t, v, 0.005, 0.45); osc(b, 'sine', f, t, v * 0.6, 0.005, 0.5); },
+  tuba(f, t, v, b) { osc(b, 'sawtooth', f, t, v * 0.5, 0.015, 0.28, {lp: f * 2.5, lpEnd: f * 1.2}); osc(b, 'sine', f, t, v * 0.6, 0.01, 0.3); },
+  log(f, t, v, b) { osc(b, 'sine', f, t, v, 0.002, 0.28, {glide: f * 0.7, glideT: 0.2}); osc(b, 'triangle', f * 2.3, t, v * 0.2, 0.002, 0.05); },
+  shaker(f, t, v, b) { noise(b, t, v * 0.5, 0.05, 'highpass', 6500, 0.7); },
+  wood(f, t, v, b) { osc(b, 'sine', 1100, t, v * 0.7, 0.001, 0.06); noise(b, t, v * 0.3, 0.02, 'bandpass', 2500, 3); },
+  kick(f, t, v, b) { osc(b, 'sine', 120, t, v, 0.002, 0.22, {glide: 45, glideT: 0.15}); },
+};
+const PERC = new Set(['shaker', 'wood', 'kick']);
+function play(name, n, t, v, bus) {
+  if (!ac) return;
+  bus = bus || sfxBus;
+  const fn = INST[name];
+  if (Array.isArray(n)) {
+    const strum = (name === 'pluck' || name === 'uke') ? 0.022 : 0;
+    n.forEach((m, i) => fn(mtof(m), t + i * strum, v * 0.7, bus));
+  } else fn(PERC.has(name) ? 0 : mtof(n), t, v, bus);
+}
+
+/* --- music sequencer --- */
+function rep(a, n) { let o = []; for (let i = 0; i < n; i++) o = o.concat(a); return o; }
+function prog(chords, pat, sh = 0) {
+  const o = [];
+  for (const c of chords) {
+    const tn = [c[0], c[1], c[2], c[0] + 12, c[1] + 12, c[2] + 12];
+    for (const p of pat) {
+      let v = 0;
+      if (p === 'C') v = c.map(x => x + sh);
+      else if (p === 'R') v = c[0] - 12 + sh;
+      else if (p === 'F') v = c[2] - 12 + sh;
+      else if (typeof p === 'number') v = tn[p] + sh;
+      o.push(v);
+    }
+  }
+  return o;
+}
+let seq = null, musicTarget = null;
+function startMusic(m) {
+  musicTarget = m;
+  if (!ac) return;
+  const now = ac.currentTime;
+  musicBus.gain.cancelScheduledValues(now);
+  musicBus.gain.setTargetAtTime(0, now, 0.08);
+  seq = null;
+  setTimeout(() => {
+    if (musicTarget !== m || !ac) return;
+    seq = {m, step: 0, next: ac.currentTime + 0.05};
+    musicBus.gain.setTargetAtTime(0.3, ac.currentTime, 0.25);
+  }, 350);
+}
+function schedule() {
+  if (!seq || !ac || ac.state !== 'running') return;
+  const m = seq.m;
+  if (seq.next < ac.currentTime - 0.2) seq.next = ac.currentTime + 0.05;
+  while (seq.next < ac.currentTime + 0.15) {
+    const s = seq.step;
+    let t = seq.next;
+    if (m.swing && s % 2 === 1) t += m.step * m.swing;
+    for (const tr of m.tracks) {
+      const n = tr.n[s % tr.n.length];
+      if (n) play(tr.i, n, t, tr.v, musicBus);
+    }
+    seq.next += m.step; seq.step++;
+  }
+}
+setInterval(schedule, 40);
+
+function basePop(t, v = 1) {
+  noise(sfxBus, t, 0.35 * v, 0.045, 'bandpass', 1600, 0.9);
+  osc(sfxBus, 'sine', 500, t, 0.25 * v, 0.002, 0.07, {glide: 1400, glideT: 0.06});
+}
+function nextNote(th) {
+  th.ni = clamp((th.ni == null ? 3 : th.ni) + pick([-2, -1, 1, 1, 2]), 0, th.scale.length - 1);
+  return th.scale[th.ni];
+}
+function popSound(th, golden) {
+  if (!ac) return;
+  const t = ac.currentTime + 0.005;
+  th.sfx(t, nextNote(th));
+  if (golden) fanfare(th);
+}
+function fanfare(th) {
+  if (!ac) return;
+  const t = ac.currentTime + 0.05, sc = th.scale;
+  for (let i = 0; i < 7; i++) play(th.inst, sc[Math.min(i, sc.length - 1)], t + i * 0.075, 0.28);
+  play('bell', [sc[0] + 12, sc[2] + 12, sc[4] + 12], t + 0.55, 0.35);
+  for (let i = 0; i < 10; i++) play('shaker', 0, t + i * 0.035, 0.4);
+  noise(sfxBus, t + 0.3, 0.12, 1.2, 'highpass', 5000, 0.5, {a: 0.3});
+}
+
+/* ---------------- DRAW HELPERS ---------------- */
+function circ(x, y, r) { g.beginPath(); g.arc(x, y, Math.max(0.1, r), 0, TAU); }
+function lin(x0, y0, x1, y1, stops) {
+  const gr = g.createLinearGradient(x0, y0, x1, y1);
+  for (const [o, c] of stops) gr.addColorStop(o, c);
+  return gr;
+}
+function poly(pts, fill) {
+  g.fillStyle = fill; g.beginPath(); g.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) g.lineTo(pts[i][0], pts[i][1]);
+  g.closePath(); g.fill();
+}
+function wavePath(y0, amp, freq, ph) {
+  g.beginPath(); g.moveTo(0, H);
+  for (let x = 0; x <= W + 20; x += 20) g.lineTo(x, y0 + Math.sin(x * freq + ph) * amp);
+  g.lineTo(W, H); g.closePath();
+}
+function starPath(R, r, n = 5) {
+  g.beginPath();
+  for (let i = 0; i < n * 2; i++) {
+    const a = -Math.PI / 2 + i * Math.PI / n, rr = i % 2 ? r : R;
+    i ? g.lineTo(Math.cos(a) * rr, Math.sin(a) * rr) : g.moveTo(Math.cos(a) * rr, Math.sin(a) * rr);
+  }
+  g.closePath();
+}
+function heartPath(s) {
+  g.beginPath(); g.moveTo(0, s * 0.75);
+  g.bezierCurveTo(-s * 1.1, s * 0.05, -s * 0.6, -s * 0.85, 0, -s * 0.35);
+  g.bezierCurveTo(s * 0.6, -s * 0.85, s * 1.1, s * 0.05, 0, s * 0.75);
+  g.closePath();
+}
+function drawCloud(x, y, s) {
+  g.fillStyle = 'rgba(255,255,255,0.95)';
+  circ(x, y, s); g.fill(); circ(x + s * 0.9, y + s * 0.2, s * 0.75); g.fill();
+  circ(x - s * 0.9, y + s * 0.25, s * 0.7); g.fill(); circ(x + s * 0.3, y - s * 0.45, s * 0.7); g.fill();
+}
+
+/* --- items (things inside bubbles) --- */
+function drawSnowflake(s, col, lw) {
+  g.strokeStyle = col; g.lineWidth = lw || s * 0.13; g.lineCap = 'round';
+  g.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const a = i * TAU / 6, c = Math.cos(a), sn = Math.sin(a);
+    g.moveTo(0, 0); g.lineTo(c * s, sn * s);
+    const bx = c * s * 0.55, by = sn * s * 0.55, L = s * 0.3;
+    for (const d of [-1, 1]) { const a2 = a + d * 0.7; g.moveTo(bx, by); g.lineTo(bx + Math.cos(a2) * L, by + Math.sin(a2) * L); }
+  }
+  g.stroke();
+}
+function drawSnowman(s) {
+  g.translate(0, -s * 0.15);
+  g.fillStyle = '#fff'; g.strokeStyle = '#b8d8f0'; g.lineWidth = s * 0.04;
+  circ(0, s * 0.45, s * 0.5); g.fill(); g.stroke();
+  circ(0, -s * 0.25, s * 0.36); g.fill(); g.stroke();
+  g.fillStyle = '#e94b7a'; g.fillRect(-s * 0.32, -s * 0.02, s * 0.64, s * 0.11); g.fillRect(s * 0.1, 0, s * 0.11, s * 0.3);
+  g.fillStyle = '#223'; circ(-s * 0.12, -s * 0.32, s * 0.05); g.fill(); circ(s * 0.12, -s * 0.32, s * 0.05); g.fill();
+  g.fillStyle = '#ff8a1f'; g.beginPath(); g.moveTo(0, -s * 0.25); g.lineTo(s * 0.32, -s * 0.2); g.lineTo(0, -s * 0.15); g.closePath(); g.fill();
+  g.strokeStyle = '#223'; g.lineWidth = s * 0.04; g.lineCap = 'round';
+  g.beginPath(); g.arc(0, -s * 0.2, s * 0.15, 0.4, Math.PI - 0.4); g.stroke();
+  g.fillStyle = '#4a6fa5'; circ(0, s * 0.3, s * 0.05); g.fill(); circ(0, s * 0.52, s * 0.05); g.fill();
+}
+function drawFlower(s, c, c2) {
+  g.fillStyle = c;
+  for (let i = 0; i < 5; i++) { g.save(); g.rotate(i * TAU / 5); g.beginPath(); g.ellipse(0, -s * 0.48, s * 0.36, s * 0.5, 0, 0, TAU); g.fill(); g.restore(); }
+  g.fillStyle = c2; circ(0, 0, s * 0.22); g.fill();
+  g.strokeStyle = '#ffe066'; g.lineWidth = s * 0.07; g.lineCap = 'round';
+  g.beginPath(); g.moveTo(0, 0); g.lineTo(s * 0.35, -s * 0.45); g.stroke();
+  g.fillStyle = '#ffe066'; circ(s * 0.35, -s * 0.45, s * 0.08); g.fill();
+}
+function drawShell(s, c) {
+  const cy = s * 0.5, R = s, n = 7, a0 = Math.PI * 1.15, a1 = Math.PI * 1.85;
+  g.fillStyle = c; g.beginPath(); g.moveTo(0, cy);
+  for (let i = 0; i < n; i++) {
+    const aa = a0 + (a1 - a0) * i / n, ab = a0 + (a1 - a0) * (i + 1) / n, am = (aa + ab) / 2;
+    if (i === 0) g.lineTo(Math.cos(aa) * R, cy + Math.sin(aa) * R);
+    g.quadraticCurveTo(Math.cos(am) * R * 1.12, cy + Math.sin(am) * R * 1.12, Math.cos(ab) * R, cy + Math.sin(ab) * R);
+  }
+  g.closePath(); g.fill();
+  g.strokeStyle = 'rgba(170,70,60,0.45)'; g.lineWidth = s * 0.05; g.beginPath();
+  for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * i / n; g.moveTo(0, cy); g.lineTo(Math.cos(a) * R * 0.95, cy + Math.sin(a) * R * 0.95); }
+  g.stroke();
+  g.fillStyle = c; g.beginPath(); g.ellipse(0, cy, s * 0.22, s * 0.12, 0, 0, TAU); g.fill();
+}
+function drawTurtle(s, t) {
+  const fl = Math.sin(t * 4) * 0.35;
+  g.fillStyle = '#6fcf7f';
+  for (const [fx, fy, base] of [[0.38, -0.42, -0.9], [0.38, 0.42, 0.9], [-0.42, -0.36, -2.3], [-0.42, 0.36, 2.3]]) {
+    g.save(); g.translate(fx * s, fy * s); g.rotate(base + (fy < 0 ? fl : -fl));
+    g.beginPath(); g.ellipse(s * 0.18, 0, s * 0.26, s * 0.11, 0, 0, TAU); g.fill(); g.restore();
+  }
+  g.beginPath(); g.ellipse(s * 0.72, 0, s * 0.22, s * 0.19, 0, 0, TAU); g.fill();
+  g.fillStyle = '#2e8b57'; g.beginPath(); g.ellipse(0, 0, s * 0.58, s * 0.46, 0, 0, TAU); g.fill();
+  g.fillStyle = '#45b36b';
+  for (const [hx, hy, hr] of [[0, 0, 0.17], [-0.3, -0.17, 0.12], [-0.3, 0.17, 0.12], [0.28, -0.17, 0.12], [0.28, 0.17, 0.12]]) { circ(hx * s, hy * s, hr * s); g.fill(); }
+  g.fillStyle = '#123'; circ(s * 0.8, -s * 0.07, s * 0.05); g.fill();
+  g.fillStyle = '#fff'; circ(s * 0.815, -s * 0.085, s * 0.018); g.fill();
+  g.strokeStyle = '#123'; g.lineWidth = s * 0.035; g.lineCap = 'round';
+  g.beginPath(); g.arc(s * 0.76, s * 0.03, s * 0.09, 0.3, 1.6); g.stroke();
+}
+function drawMarigold(s) {
+  for (const [R, n, c] of [[s * 0.62, 12, '#ff8c00'], [s * 0.45, 10, '#ffa726'], [s * 0.28, 8, '#ffca28']]) {
+    g.fillStyle = c;
+    for (let i = 0; i < n; i++) {
+      const a = i * TAU / n + R;
+      g.beginPath(); g.ellipse(Math.cos(a) * R * 0.62, Math.sin(a) * R * 0.62, R * 0.42, R * 0.28, a, 0, TAU); g.fill();
+    }
+  }
+  g.fillStyle = '#e65100'; circ(0, 0, s * 0.12); g.fill();
+}
+function drawFish(s, body, stripe, dir = 1, t = 0) {
+  g.save(); g.scale(dir, 1);
+  const w = Math.sin(t * 10) * 0.25;
+  g.fillStyle = body;
+  g.beginPath(); g.moveTo(-s * 0.6, 0); g.lineTo(-s * 1.05, -s * 0.42 + w * s * 0.3); g.lineTo(-s * 1.05, s * 0.42 + w * s * 0.3); g.closePath(); g.fill();
+  g.beginPath(); g.ellipse(-s * 0.05, -s * 0.4, s * 0.3, s * 0.16, -0.3, 0, TAU); g.fill();
+  g.beginPath(); g.ellipse(0, 0, s * 0.7, s * 0.45, 0, 0, TAU); g.fill();
+  if (stripe) {
+    g.save(); g.clip(); g.fillStyle = stripe; g.strokeStyle = '#222'; g.lineWidth = s * 0.05;
+    for (const x of [-0.32, 0.18]) { g.fillRect(x * s - s * 0.09, -s, s * 0.18, 2 * s); g.strokeRect(x * s - s * 0.09, -s, s * 0.18, 2 * s); }
+    g.restore();
+  }
+  g.fillStyle = '#fff'; circ(s * 0.38, -s * 0.1, s * 0.15); g.fill();
+  g.fillStyle = '#111'; circ(s * 0.42, -s * 0.1, s * 0.08); g.fill();
+  g.fillStyle = '#fff'; circ(s * 0.44, -s * 0.13, s * 0.03); g.fill();
+  g.strokeStyle = 'rgba(0,0,0,0.5)'; g.lineWidth = s * 0.05; g.lineCap = 'round';
+  g.beginPath(); g.arc(s * 0.48, s * 0.08, s * 0.1, 0.3, Math.PI - 0.8); g.stroke();
+  g.restore();
+}
+function drawStar(s, c, face) {
+  g.fillStyle = c; g.lineJoin = 'round'; starPath(s, s * 0.5); g.fill();
+  g.strokeStyle = 'rgba(255,255,255,0.6)'; g.lineWidth = s * 0.06; g.stroke();
+  if (face) {
+    g.fillStyle = '#3a2a1a'; circ(-s * 0.16, -s * 0.04, s * 0.07); g.fill(); circ(s * 0.16, -s * 0.04, s * 0.07); g.fill();
+    g.strokeStyle = '#3a2a1a'; g.lineWidth = s * 0.05; g.lineCap = 'round';
+    g.beginPath(); g.arc(0, s * 0.06, s * 0.13, 0.4, Math.PI - 0.4); g.stroke();
+    g.fillStyle = 'rgba(255,110,140,0.55)'; circ(-s * 0.28, s * 0.1, s * 0.07); g.fill(); circ(s * 0.28, s * 0.1, s * 0.07); g.fill();
+  }
+}
+function drawHeart(s, c) {
+  g.fillStyle = c; heartPath(s * 0.85); g.fill();
+  g.fillStyle = 'rgba(255,255,255,0.55)'; g.beginPath(); g.ellipse(-s * 0.32, -s * 0.22, s * 0.12, s * 0.07, -0.7, 0, TAU); g.fill();
+}
+function drawBalloon(s, c) {
+  g.strokeStyle = 'rgba(80,80,80,0.7)'; g.lineWidth = s * 0.04;
+  g.beginPath(); g.moveTo(0, s * 0.55); g.quadraticCurveTo(s * 0.15, s * 0.8, 0, s * 1.0); g.stroke();
+  g.fillStyle = c; g.beginPath(); g.ellipse(0, -s * 0.1, s * 0.5, s * 0.6, 0, 0, TAU); g.fill();
+  g.beginPath(); g.moveTo(-s * 0.08, s * 0.56); g.lineTo(s * 0.08, s * 0.56); g.lineTo(0, s * 0.46); g.fill();
+  g.fillStyle = 'rgba(255,255,255,0.5)'; g.beginPath(); g.ellipse(-s * 0.2, -s * 0.3, s * 0.1, s * 0.18, 0.4, 0, TAU); g.fill();
+}
+function drawItem(it, s, t) {
+  switch (it.k) {
+    case 'snowflake': g.rotate(t * 0.5); drawSnowflake(s, it.c); g.fillStyle = it.c; circ(0, 0, s * 0.12); g.fill(); break;
+    case 'snowman': drawSnowman(s); break;
+    case 'heart': drawHeart(s, it.c); break;
+    case 'flower': g.rotate(t * 0.3); drawFlower(s, it.c, it.c2); break;
+    case 'shell': drawShell(s, it.c); break;
+    case 'turtle': drawTurtle(s, t); break;
+    case 'marigold': g.rotate(t * 0.4); drawMarigold(s); break;
+    case 'fish': drawFish(s * 0.85, it.c, it.c2, 1, t); break;
+    case 'star': g.rotate(Math.sin(t * 2) * 0.2); drawStar(s, it.c, true); break;
+    case 'balloon': drawBalloon(s, it.c); break;
+  }
+}
+
+/* ---------------- THEMES ---------------- */
+function mountains(minP, maxP, base, n) {
+  const pts = [[-50, H]], step = W * 1.1 / n;
+  for (let i = 0; i <= n; i++) {
+    const xp = -W * 0.05 + i * step + rnd(-20, 20);
+    pts.push([xp, rnd(minP, maxP)]);
+    if (i < n) pts.push([xp + step / 2, base - rnd(0, H * 0.06)]);
+  }
+  pts.push([W + 50, H]);
+  return pts;
+}
+
+const ICE = {
+  name: 'Ice Kingdom', col: '#8fdcff', hues: [190, 200, 210, 230, 265],
+  items: [{k: 'snowflake', c: '#ffffff'}, {k: 'snowflake', c: '#cfefff'}, {k: 'snowman'}, {k: 'heart', c: '#9fe0ff'}],
+  burst: [{k: 'flake', n: 10, c: ['#ffffff', '#dff6ff', '#b0e8ff'], gr: 0.12, sp: 0.9}, {k: 'spark', n: 18, c: ['#c9f6ff', '#ffffff', '#e2d4ff'], sp: 1.3}],
+  ring: '#e6fbff', inst: 'bell', scale: [74, 76, 78, 81, 83, 86, 88, 90, 93],
+  sfx(t, m) {
+    basePop(t); play('bell', m, t + 0.01, 0.35);
+    [7, 12, 16, 19].forEach((d, i) => play('bell', m + d, t + 0.06 + i * 0.05, 0.07));
+    noise(sfxBus, t, 0.06, 0.5, 'highpass', 8000, 0.5);
+  },
+  init(st) {
+    st.sky = lin(0, 0, 0, H, [[0, '#0a1747'], [0.45, '#2a4c9c'], [1, '#a6d8f7']]);
+    st.stars = arr(50, () => ({x: rnd(0, W), y: rnd(0, H * 0.5), r: rnd(0.6, 1.8), p: rnd(0, TAU)}));
+    st.flakes = arr(70, () => ({x: rnd(0, W), y: rnd(0, H), s: S * rnd(0.004, 0.012), v: S * rnd(0.03, 0.09), p: rnd(0, TAU), shape: Math.random() < 0.3}));
+    st.m1 = mountains(H * 0.42, H * 0.58, H * 0.8, 6);
+    st.m2 = mountains(H * 0.58, H * 0.7, H * 0.86, 5);
+    st.mg1 = lin(0, H * 0.42, 0, H * 0.82, [[0, '#ffffff'], [1, '#7aa9de']]);
+    st.mg2 = lin(0, H * 0.58, 0, H * 0.88, [[0, '#ffffff'], [1, '#a9cdf2']]);
+  },
+  draw(st, t, dt) {
+    g.fillStyle = st.sky; g.fillRect(0, 0, W, H);
+    g.fillStyle = '#fff';
+    for (const s of st.stars) { g.globalAlpha = 0.3 + 0.7 * Math.abs(Math.sin(t * 1.5 + s.p)); circ(s.x, s.y, s.r); g.fill(); }
+    g.globalAlpha = 1;
+    g.save(); g.globalCompositeOperation = 'lighter'; g.lineCap = 'round';
+    const cols = ['rgba(90,255,190,0.16)', 'rgba(120,170,255,0.14)', 'rgba(210,140,255,0.12)'];
+    for (let i = 0; i < 3; i++) {
+      g.strokeStyle = cols[i]; g.lineWidth = H * 0.07; g.beginPath();
+      let first = true;
+      for (let x = -20; x <= W + 20; x += 16) {
+        const y = H * (0.13 + i * 0.06) + Math.sin(x * 0.005 + t * 0.35 + i * 2) * H * 0.04 + Math.sin(x * 0.012 - t * 0.22 + i) * H * 0.015;
+        if (first) { g.moveTo(x, y); first = false; } else g.lineTo(x, y);
+      }
+      g.stroke();
+    }
+    g.restore();
+    poly(st.m1, st.mg1); poly(st.m2, st.mg2);
+    g.fillStyle = '#eef8ff'; g.beginPath(); g.moveTo(0, H); g.lineTo(0, H * 0.87);
+    g.quadraticCurveTo(W * 0.3, H * 0.83, W * 0.55, H * 0.87); g.quadraticCurveTo(W * 0.8, H * 0.91, W, H * 0.86);
+    g.lineTo(W, H); g.fill();
+    for (const f of st.flakes) {
+      f.y += f.v * dt; f.x += Math.sin(t * 0.8 + f.p) * S * 0.02 * dt;
+      if (f.y > H + 10) { f.y = -10; f.x = rnd(0, W); }
+      if (f.shape) { g.save(); g.translate(f.x, f.y); g.rotate(t * 0.5 + f.p); g.globalAlpha = 0.85; drawSnowflake(f.s * 1.8, '#fff', f.s * 0.35); g.restore(); }
+      else { g.fillStyle = 'rgba(255,255,255,0.85)'; circ(f.x, f.y, f.s * 0.6); g.fill(); }
+    }
+  },
+};
+ICE.music = (() => {
+  const ch = [[59, 62, 66], [55, 59, 62], [50, 54, 57], [57, 61, 64]];
+  const c8 = ch.concat(ch);
+  return {step: 0.36, tracks: [
+    {i: 'box', v: 0.12, n: prog(c8, [0, 1, 2, 3, 4, 3, 2, 1], 12)},
+    {i: 'pad', v: 0.07, n: prog(c8, ['C', null, null, null, null, null, null, null])},
+    {i: 'bass', v: 0.18, n: prog(c8, ['R', null, null, null, 'F', null, null, null])},
+    {i: 'bell', v: 0.17, n: [
+      78, 0, 0, 0, 83, 0, 81, 0, 79, 0, 0, 0, 74, 0, 0, 0, 78, 0, 76, 0, 74, 0, 76, 0, 76, 0, 0, 0, 73, 0, 0, 0,
+      74, 0, 78, 0, 83, 0, 85, 0, 86, 0, 0, 0, 83, 0, 79, 0, 81, 0, 78, 0, 74, 0, 78, 0, 76, 0, 0, 0, 0, 0, 0, 0]},
+  ]};
+})();
+
+function drawCanoe(x, y, s) {
+  g.strokeStyle = '#5a3418'; g.lineWidth = s * 0.08; g.beginPath(); g.moveTo(x, y - s * 0.1); g.lineTo(x, y - s * 1.6); g.stroke();
+  g.fillStyle = '#f5e3bd'; g.strokeStyle = '#c9a26b'; g.lineWidth = s * 0.05;
+  g.beginPath(); g.moveTo(x - s * 0.1, y - s * 1.75);
+  g.quadraticCurveTo(x + s * 1.3, y - s * 1.2, x + s * 0.1, y - s * 0.2);
+  g.quadraticCurveTo(x + s * 0.35, y - s * 0.95, x - s * 0.1, y - s * 1.75); g.closePath(); g.fill(); g.stroke();
+  g.fillStyle = '#7a4421'; g.beginPath(); g.moveTo(x - s * 1.4, y - s * 0.2); g.lineTo(x + s * 1.4, y - s * 0.2);
+  g.quadraticCurveTo(x, y + s * 0.6, x - s * 1.4, y - s * 0.2); g.fill();
+}
+function drawPalm(x, y, h, sway) {
+  const tx = x + h * 0.15 + sway, ty = y - h;
+  g.strokeStyle = '#8a5a2b'; g.lineWidth = S * 0.028; g.lineCap = 'round';
+  g.beginPath(); g.moveTo(x, y); g.quadraticCurveTo(x + h * 0.25, y - h * 0.5, tx, ty); g.stroke();
+  for (const a of [-2.9, -2.4, -1.9, -1.3, -0.8, -0.3, 0.2]) {
+    const aa = a + sway * 0.004;
+    const ex = tx + Math.cos(aa) * h * 0.55, ey = ty + Math.sin(aa) * h * 0.25 + h * 0.2;
+    const cx = tx + Math.cos(aa) * h * 0.3, cy = ty - h * 0.15;
+    g.strokeStyle = '#2e9e4f'; g.lineWidth = S * 0.032; g.beginPath(); g.moveTo(tx, ty); g.quadraticCurveTo(cx, cy, ex, ey); g.stroke();
+    g.strokeStyle = '#5fd17a'; g.lineWidth = S * 0.01; g.beginPath(); g.moveTo(tx, ty); g.quadraticCurveTo(cx, cy, ex, ey); g.stroke();
+  }
+  g.fillStyle = '#5a3a1a';
+  circ(tx - S * 0.012, ty + S * 0.015, S * 0.014); g.fill(); circ(tx + S * 0.014, ty + S * 0.018, S * 0.014); g.fill();
+}
+const ISLAND = {
+  name: 'Island Voyage', col: '#3fd0d4', hues: [170, 185, 200, 40, 330],
+  items: [{k: 'flower', c: '#ff4f7b', c2: '#ffd166'}, {k: 'flower', c: '#ff9f1c', c2: '#fff4d6'}, {k: 'shell', c: '#ffb5a7'}, {k: 'turtle'}],
+  burst: [{k: 'drop', n: 14, c: ['#4fd8ff', '#b3f0ff', '#ffffff'], sp: 1.1, gr: 1.2}, {k: 'petal', n: 9, c: ['#ff4f7b', '#ff9ec0', '#ffd166'], sp: 0.8, gr: 0.2}, {k: 'spark', n: 6, c: ['#ffffff', '#fff3a0']}],
+  ring: '#c9f7ff', inst: 'marimba', scale: [72, 74, 76, 79, 81, 84, 86, 88],
+  sfx(t, m) {
+    basePop(t); play('marimba', m, t, 0.4);
+    osc(sfxBus, 'sine', 300, t + 0.02, 0.3, 0.004, 0.14, {glide: 1000, glideT: 0.12});
+    noise(sfxBus, t + 0.03, 0.18, 0.3, 'lowpass', 2000, 0.8, {fEnd: 300});
+  },
+  init(st) {
+    st.hz = H * 0.6;
+    st.sky = lin(0, 0, 0, st.hz, [[0, '#38b6f0'], [0.7, '#a8e8ff'], [1, '#fff1c9']]);
+    st.sea = lin(0, st.hz, 0, H, [[0, '#3cc8d8'], [0.5, '#139bbf'], [1, '#0b6f9c']]);
+    st.clouds = arr(4, () => ({x: rnd(0, W), y: rnd(H * 0.1, H * 0.3), s: S * rnd(0.04, 0.07), v: S * rnd(0.01, 0.025)}));
+    st.canoe = rnd(0, W);
+    st.sparkles = arr(18, () => ({x: rnd(0, W), y: rnd(st.hz + 5, H), p: rnd(0, TAU)}));
+  },
+  draw(st, t, dt) {
+    const hz = st.hz;
+    g.fillStyle = st.sky; g.fillRect(0, 0, W, hz + 2);
+    const sx = W * 0.78, sy = H * 0.2, sr = S * 0.07;
+    const gl = g.createRadialGradient(sx, sy, sr * 0.5, sx, sy, sr * 3);
+    gl.addColorStop(0, 'rgba(255,245,170,0.8)'); gl.addColorStop(1, 'rgba(255,245,170,0)');
+    g.fillStyle = gl; circ(sx, sy, sr * 3); g.fill();
+    g.save(); g.translate(sx, sy); g.rotate(t * 0.15); g.fillStyle = 'rgba(255,240,150,0.35)';
+    for (let i = 0; i < 12; i++) { g.rotate(TAU / 12); g.beginPath(); g.moveTo(sr * 1.1, -sr * 0.12); g.lineTo(sr * 1.9, 0); g.lineTo(sr * 1.1, sr * 0.12); g.fill(); }
+    g.restore();
+    g.fillStyle = '#fff3a0'; circ(sx, sy, sr); g.fill();
+    for (const c of st.clouds) { c.x += c.v * dt; if (c.x > W + c.s * 3) c.x = -c.s * 3; drawCloud(c.x, c.y, c.s); }
+    g.fillStyle = '#2f8f63'; g.beginPath(); g.ellipse(W * 0.84, hz, W * 0.12, H * 0.04, 0, Math.PI, TAU); g.fill();
+    g.fillStyle = st.sea; g.fillRect(0, hz, W, H - hz);
+    g.lineWidth = 2;
+    for (let k = 0; k < 6; k++) {
+      const y = hz + (H - hz) * (0.08 + k * 0.16);
+      g.strokeStyle = `rgba(255,255,255,${0.35 - k * 0.04})`; g.beginPath();
+      for (let x = 0; x <= W; x += 14) { const yy = y + Math.sin(x * 0.03 + t * (1.2 + k * 0.2) + k) * (2 + k); x ? g.lineTo(x, yy) : g.moveTo(x, yy); }
+      g.stroke();
+    }
+    g.fillStyle = '#fff';
+    for (const s of st.sparkles) {
+      g.globalAlpha = Math.max(0, Math.sin(t * 2 + s.p)) * 0.8;
+      g.beginPath(); g.ellipse(s.x, s.y, 5, 1.5, 0, 0, TAU); g.fill();
+    }
+    g.globalAlpha = 1;
+    st.canoe += S * 0.03 * dt; if (st.canoe > W + S * 0.15) st.canoe = -S * 0.15;
+    drawCanoe(st.canoe, hz + H * 0.02 + Math.sin(t * 1.5) * 3, S * 0.045);
+    g.fillStyle = '#ffe0a3'; g.beginPath(); g.ellipse(W * 0.16, hz + H * 0.045, W * 0.2, H * 0.045, 0, 0, TAU); g.fill();
+    drawPalm(W * 0.12, hz + H * 0.03, H * 0.24, Math.sin(t * 0.9) * S * 0.012);
+  },
+};
+ISLAND.music = (() => {
+  const C = [60, 64, 67], F = [53, 57, 60], G = [55, 59, 62], Am = [57, 60, 64];
+  const ch = [C, F, G, C, Am, F, G, C];
+  return {step: 0.29, tracks: [
+    {i: 'uke', v: 0.11, n: prog(ch, ['C', null, 'C', 'C', null, 'C', 'C', null])},
+    {i: 'bass', v: 0.24, n: prog(ch, ['R', null, null, 'R', null, null, 'F', null])},
+    {i: 'log', v: 0.26, n: rep([48, 0, 0, 43, 0, 0, 45, 0], 8)},
+    {i: 'shaker', v: 0.22, n: rep([0, 1, 0, 1, 0, 1, 0, 1], 8)},
+    {i: 'marimba', v: 0.22, n: [
+      72, 0, 76, 0, 79, 0, 76, 0, 77, 0, 0, 76, 74, 0, 72, 0, 74, 0, 79, 0, 81, 0, 79, 0, 76, 0, 0, 0, 0, 0, 0, 0,
+      81, 0, 79, 0, 76, 0, 79, 0, 81, 0, 84, 0, 81, 0, 79, 0, 76, 0, 74, 0, 79, 0, 74, 0, 72, 0, 0, 0, 0, 0, 0, 0]},
+  ]};
+})();
+
+function drawFlag(w, h, c) {
+  g.fillStyle = c; g.beginPath(); g.moveTo(-w / 2, 0); g.lineTo(w / 2, 0); g.lineTo(w / 2, h * 0.85);
+  for (let k = 1; k <= 6; k++) g.lineTo(w / 2 - k * w / 6, h * (k % 2 ? 1 : 0.85));
+  g.closePath(); g.fill();
+  g.fillStyle = 'rgba(255,255,255,0.38)';
+  circ(0, h * 0.45, w * 0.15); g.fill();
+  for (const [dx, dy] of [[-0.28, 0.45], [0.28, 0.45], [0, 0.2], [0, 0.72]]) {
+    g.save(); g.translate(dx * w, dy * h); g.rotate(Math.PI / 4); g.fillRect(-w * 0.05, -w * 0.05, w * 0.1, w * 0.1); g.restore();
+  }
+}
+const FIESTA = {
+  name: 'Marigold Fiesta', col: '#ff9f2e', hues: [20, 35, 50, 310, 280],
+  items: [{k: 'marigold'}, {k: 'marigold'}, {k: 'star', c: '#ffd23f'}, {k: 'heart', c: '#ff4fa3'}],
+  burst: [{k: 'petal', n: 14, c: ['#ff8c00', '#ffa726', '#ffca28'], gr: 0.3}, {k: 'confetti', n: 12, c: ['#ff4fa3', '#29d3c3', '#ffd23f', '#9b5de5', '#00bbf9'], gr: 0.5}, {k: 'note', n: 3, c: ['#fff3b0', '#ffd6f0']}],
+  ring: '#ffd27a', inst: 'pluck', scale: [69, 71, 72, 74, 76, 77, 80, 81, 83, 84],
+  sfx(t, m) {
+    basePop(t); play('pluck', [m - 12, m - 5, m, m + 7], t, 0.45);
+    play('shaker', 0, t + 0.05, 0.5); play('shaker', 0, t + 0.13, 0.4);
+  },
+  init(st) {
+    st.sky = lin(0, 0, 0, H, [[0, '#1d0a3d'], [0.55, '#5a1a6e'], [0.85, '#c2457a'], [1, '#ff8c42']]);
+    st.stars = arr(45, () => ({x: rnd(0, W), y: rnd(0, H * 0.6), r: rnd(0.6, 1.8), p: rnd(0, TAU)}));
+    st.town = []; let x = -10;
+    while (x < W) {
+      const w = S * rnd(0.07, 0.13), h = H * rnd(0.1, 0.24);
+      const wins = [];
+      for (let yy = h * 0.15; yy < h - S * 0.03; yy += S * 0.035)
+        for (let xx = w * 0.2; xx < w - S * 0.015; xx += S * 0.03) if (Math.random() < 0.55) wins.push([xx, yy]);
+      st.town.push({x, w, h, c: pick(['#3b1557', '#2d1a5c', '#4a1d5e', '#26305e', '#3a2466']), wins});
+      x += w + S * rnd(0, 0.012);
+    }
+    st.petals = arr(28, () => ({x: rnd(0, W), y: rnd(0, H), v: S * rnd(0.03, 0.07), p: rnd(0, TAU), s: S * rnd(0.006, 0.011), c: pick(['#ff8c00', '#ffa726', '#ffca28'])}));
+    st.candles = arr(Math.max(5, Math.round(W / (S * 0.16))), i => ({x: (i + 0.5) * W / Math.max(5, Math.round(W / (S * 0.16))) + rnd(-8, 8), p: rnd(0, TAU), h: S * rnd(0.035, 0.06)}));
+  },
+  draw(st, t, dt) {
+    g.fillStyle = st.sky; g.fillRect(0, 0, W, H);
+    g.fillStyle = '#fff';
+    for (const s of st.stars) { g.globalAlpha = 0.3 + 0.7 * Math.abs(Math.sin(t * 1.3 + s.p)); circ(s.x, s.y, s.r); g.fill(); }
+    g.globalAlpha = 1;
+    const mx = W * 0.2, my = H * 0.2 + S * 0.05, mr = S * 0.05;
+    const mg = g.createRadialGradient(mx, my, mr * 0.8, mx, my, mr * 3);
+    mg.addColorStop(0, 'rgba(255,240,200,0.45)'); mg.addColorStop(1, 'rgba(255,240,200,0)');
+    g.fillStyle = mg; circ(mx, my, mr * 3); g.fill(); g.fillStyle = '#fff6d6'; circ(mx, my, mr); g.fill();
+    // glowing marigold arch
+    const R = Math.min(W * 0.6, H * 0.6), cx = W / 2, cy = H * 0.95;
+    g.save(); g.globalCompositeOperation = 'lighter';
+    for (let i = 0; i < 70; i++) {
+      const a = Math.PI + 0.12 + (Math.PI - 0.24) * i / 69;
+      const px = cx + Math.cos(a) * R, py = cy + Math.sin(a) * R;
+      const al = 0.35 + 0.35 * Math.sin(t * 2 - i * 0.25);
+      g.fillStyle = `rgba(255,150,30,${al * 0.35})`; circ(px, py, S * 0.018); g.fill();
+      g.fillStyle = `rgba(255,190,60,${al})`; circ(px, py, S * 0.007); g.fill();
+    }
+    g.restore();
+    const base = H * 0.88;
+    for (const b of st.town) {
+      g.fillStyle = b.c; g.fillRect(b.x, base - b.h, b.w, b.h);
+      g.fillStyle = 'rgba(255,211,107,0.85)';
+      for (const [wx, wy] of b.wins) g.fillRect(b.x + wx, base - b.h + wy, S * 0.012, S * 0.016);
+    }
+    g.fillStyle = '#2a0f3d'; g.fillRect(0, base, W, H - base);
+    for (const c of st.candles) {
+      const y = H * 0.95, fl = 1 + Math.sin(t * 9 + c.p) * 0.15 + Math.sin(t * 13 + c.p) * 0.1;
+      g.fillStyle = '#fff1d6'; g.fillRect(c.x - S * 0.01, y - c.h, S * 0.02, c.h);
+      const gg = g.createRadialGradient(c.x, y - c.h - S * 0.015, 1, c.x, y - c.h - S * 0.015, S * 0.06);
+      gg.addColorStop(0, 'rgba(255,200,80,0.5)'); gg.addColorStop(1, 'rgba(255,200,80,0)');
+      g.fillStyle = gg; circ(c.x, y - c.h - S * 0.015, S * 0.06); g.fill();
+      g.fillStyle = '#ffb12b'; g.beginPath(); g.ellipse(c.x, y - c.h - S * 0.014 * fl, S * 0.007, S * 0.016 * fl, 0, 0, TAU); g.fill();
+      g.fillStyle = '#fff3b0'; g.beginPath(); g.ellipse(c.x, y - c.h - S * 0.008, S * 0.0035, S * 0.008, 0, 0, TAU); g.fill();
+    }
+    const fcols = ['#ff4fa3', '#ff8c00', '#ffd23f', '#29d3c3', '#9b5de5', '#4cd964', '#00bbf9'];
+    const n = Math.max(6, Math.round(W / (S * 0.14)));
+    for (let j = 0; j < 2; j++) {
+      const y0 = hud.home.y + hud.home.r + 14 + j * H * 0.1, sag = S * 0.04, fw = W / n * 0.82, fh = fw * 1.15;
+      g.strokeStyle = 'rgba(255,255,255,0.5)'; g.lineWidth = 1.5; g.beginPath();
+      for (let x = 0; x <= W; x += 10) { const y = y0 + sag * Math.sin(Math.PI * x / W); x ? g.lineTo(x, y) : g.moveTo(x, y); }
+      g.stroke();
+      for (let i = 0; i < n; i++) {
+        const x = (i + 0.5) * W / n, y = y0 + sag * Math.sin(Math.PI * x / W);
+        g.save(); g.translate(x, y); g.rotate(Math.sin(t * 1.6 + i * 0.7 + j) * 0.08);
+        drawFlag(fw, fh, fcols[(i + j * 3) % fcols.length]); g.restore();
+      }
+    }
+    for (const p of st.petals) {
+      p.y += p.v * dt; p.x += Math.sin(t + p.p) * S * 0.03 * dt;
+      if (p.y > H + 10) { p.y = -10; p.x = rnd(0, W); }
+      g.fillStyle = p.c; g.beginPath(); g.ellipse(p.x, p.y, p.s, p.s * 0.6, t * 2 + p.p, 0, TAU); g.fill();
+    }
+  },
+};
+FIESTA.music = (() => {
+  const Am = [57, 60, 64], E = [52, 56, 59], Dm = [50, 53, 57];
+  const ch = [Am, E, E, Am, Dm, Am, E, Am];
+  const mel = [76, 0, 77, 0, 76, 0, 80, 0, 0, 0, 76, 0, 74, 0, 76, 0, 74, 0, 72, 0, 0, 0, 69, 0,
+               74, 0, 77, 0, 81, 0, 76, 0, 72, 0, 76, 0, 74, 0, 71, 0, 68, 0, 69, 0, 0, 0, 0, 0];
+  const pcs = [9, 11, 0, 2, 4, 5, 8];
+  const third = mel.map(m => {
+    if (!m) return 0;
+    const i = pcs.indexOf(m % 12); if (i < 0) return 0;
+    const tp = pcs[(i - 2 + 7) % 7]; return m - ((m % 12 - tp + 12) % 12);
+  });
+  return {step: 0.19, tracks: [
+    {i: 'bass', v: 0.24, n: prog(ch, ['R', null, null, null, 'F', null])},
+    {i: 'pluck', v: 0.12, n: prog(ch, [null, null, 'C', null, 'C', null])},
+    {i: 'shaker', v: 0.16, n: rep([1, 0, 1, 1, 1, 0], 8)},
+    {i: 'brass', v: 0.18, n: mel},
+    {i: 'brass', v: 0.11, n: third},
+  ]};
+})();
+
+function newBgFish() {
+  const c = pick(['#ff7b25', '#ffd23f', '#ff5fa2', '#7ee081', '#b28dff']);
+  return {x: rnd(-50, W + 50), y: rnd(H * 0.15, H * 0.75), s: S * rnd(0.02, 0.038), v: S * rnd(0.04, 0.1), dir: pick([1, -1]), c, st: c === '#ff7b25' ? '#fff' : null, p: rnd(0, TAU)};
+}
+function coralBranch(x, y, len, ang, d, lw, t) {
+  const ex = x + Math.cos(ang) * len, ey = y + Math.sin(ang) * len;
+  g.lineWidth = lw; g.beginPath(); g.moveTo(x, y); g.lineTo(ex, ey); g.stroke();
+  if (d > 0) {
+    const sw = Math.sin(t * 0.8 + x * 0.01) * 0.06;
+    coralBranch(ex, ey, len * 0.75, ang - 0.45 + sw, d - 1, lw * 0.75, t);
+    coralBranch(ex, ey, len * 0.75, ang + 0.4 + sw, d - 1, lw * 0.75, t);
+  } else { circ(ex, ey, lw * 0.6); g.fill(); }
+}
+const REEF = {
+  name: 'Coral Reef', col: '#2fa6e8', hues: [180, 190, 200, 160, 210],
+  items: [{k: 'fish', c: '#ff7b25', c2: '#ffffff'}, {k: 'fish', c: '#ffd23f'}, {k: 'fish', c: '#ff5fa2'}, {k: 'turtle'}, {k: 'star', c: '#ff8a5c'}],
+  burst: [{k: 'bubble', n: 14, c: ['#ffffff'], gr: -0.6, sp: 0.8}, {k: 'fish', n: 3, c: ['#ff7b25', '#ffd23f', '#ff5fa2', '#7ee081'], sp: 0.6, life: 1.6}, {k: 'spark', n: 8, c: ['#bff7ff', '#ffffff']}],
+  ring: '#c8f4ff', inst: 'steel', scale: [65, 67, 69, 72, 74, 77, 79, 81, 84],
+  sfx(t, m) {
+    basePop(t); play('steel', m, t, 0.35);
+    osc(sfxBus, 'sine', 220, t + 0.02, 0.28, 0.004, 0.09, {glide: 600, glideT: 0.08});
+    osc(sfxBus, 'sine', 330, t + 0.12, 0.22, 0.004, 0.09, {glide: 850, glideT: 0.08});
+  },
+  init(st) {
+    st.sky = lin(0, 0, 0, H, [[0, '#5fd7ee'], [0.45, '#1593c6'], [1, '#0a4a80']]);
+    st.weed = arr(8, () => ({x: rnd(0, W), h: H * rnd(0.15, 0.32), p: rnd(0, TAU), c: pick(['#2fbf71', '#46d68c', '#1f9e5c'])}));
+    st.fish = arr(7, newBgFish);
+    st.bub = arr(25, () => ({x: rnd(0, W), y: rnd(0, H), r: rnd(1.5, 4), v: S * rnd(0.05, 0.12)}));
+  },
+  draw(st, t, dt) {
+    g.fillStyle = st.sky; g.fillRect(0, 0, W, H);
+    g.save(); g.globalCompositeOperation = 'lighter'; g.fillStyle = 'rgba(255,255,255,0.06)';
+    for (let i = 0; i < 5; i++) {
+      const x0 = W * (0.1 + i * 0.2) + Math.sin(t * 0.2 + i) * W * 0.03;
+      g.beginPath(); g.moveTo(x0 - W * 0.02, 0); g.lineTo(x0 + W * 0.02, 0); g.lineTo(x0 + W * 0.1, H * 0.9); g.lineTo(x0 - W * 0.02, H * 0.9); g.fill();
+    }
+    g.restore();
+    for (const f of st.fish) {
+      f.x += f.v * f.dir * dt;
+      if (f.x > W + 80 || f.x < -80) Object.assign(f, newBgFish(), {x: f.dir > 0 ? -60 : W + 60, dir: f.dir});
+      g.save(); g.globalAlpha = 0.9; g.translate(f.x, f.y + Math.sin(t * 1.5 + f.p) * 6); drawFish(f.s, f.c, f.st, f.dir, t + f.p); g.restore();
+    }
+    g.fillStyle = '#f0d397'; wavePath(H * 0.88, H * 0.012, 0.01, 0); g.fill();
+    g.fillStyle = 'rgba(200,160,90,0.35)';
+    for (let i = 0; i < 30; i++) { circ((i * 97.3) % W, H * 0.91 + ((i * 53) % 40) / 40 * H * 0.08, 2); g.fill(); }
+    const by = H * 0.9;
+    g.strokeStyle = g.fillStyle = '#ff6f91'; g.lineCap = 'round';
+    coralBranch(W * 0.1, by, S * 0.07, -Math.PI / 2, 3, S * 0.022, t);
+    g.strokeStyle = g.fillStyle = '#ff9f43';
+    coralBranch(W * 0.9, by, S * 0.06, -Math.PI / 2 - 0.15, 3, S * 0.02, t);
+    g.fillStyle = '#ffb36b'; g.beginPath(); g.ellipse(W * 0.45, by, S * 0.08, S * 0.06, 0, Math.PI, TAU); g.fill();
+    g.strokeStyle = '#e8894a'; g.lineWidth = 2;
+    for (let i = 0; i < 4; i++) { g.beginPath(); g.ellipse(W * 0.45, by, S * 0.065 - i * S * 0.015, S * 0.045 - i * S * 0.011, 0, Math.PI, TAU); g.stroke(); }
+    for (let i = 0; i < 9; i++) {
+      const a = -Math.PI / 2 + (i - 4) * 0.25, sw = Math.sin(t * 1.5 + i) * 0.2;
+      const L = S * 0.07, ex = W * 0.7 + Math.cos(a + sw) * L, ey = by + Math.sin(a + sw) * L;
+      g.strokeStyle = '#c27bff'; g.lineWidth = S * 0.012;
+      g.beginPath(); g.moveTo(W * 0.7, by); g.quadraticCurveTo(W * 0.7 + Math.cos(a) * L * 0.6, by + Math.sin(a) * L * 0.6, ex, ey); g.stroke();
+      g.fillStyle = '#f0c8ff'; circ(ex, ey, S * 0.009); g.fill();
+    }
+    for (const w of st.weed) {
+      g.strokeStyle = w.c; g.lineWidth = S * 0.018; g.lineCap = 'round'; g.beginPath(); g.moveTo(w.x, H * 0.93);
+      for (let i = 1; i <= 10; i++) g.lineTo(w.x + Math.sin(t * 1.2 + w.p + i * 0.5) * S * 0.006 * i, H * 0.93 - w.h * i / 10);
+      g.stroke();
+    }
+    g.save(); g.translate(W * 0.3, H * 0.94); g.rotate(0.2); drawStar(S * 0.035, '#ff8a5c', true); g.restore();
+    g.strokeStyle = 'rgba(255,255,255,0.6)'; g.lineWidth = 1.2;
+    for (const b of st.bub) {
+      b.y -= b.v * dt; b.x += Math.sin(t * 2 + b.y * 0.02) * 0.3;
+      if (b.y < -10) { b.y = H + 10; b.x = rnd(0, W); }
+      circ(b.x, b.y, b.r); g.stroke();
+    }
+  },
+};
+REEF.music = (() => {
+  const F = [53, 57, 60], Dm = [50, 53, 57], Bb = [46, 50, 53], C = [48, 52, 55];
+  const ch = [F, Dm, Bb, C, F, Dm, Bb, C];
+  return {step: 0.3, tracks: [
+    {i: 'bass', v: 0.26, n: prog(ch, ['R', null, null, null, null, 'F', null, null])},
+    {i: 'marimba', v: 0.09, n: prog(ch, [null, 0, null, 1, null, 2, null, 1], 12)},
+    {i: 'shaker', v: 0.13, n: rep([0, 0, 1, 0, 0, 0, 1, 0], 8)},
+    {i: 'steel', v: 0.2, n: [
+      77, 0, 81, 0, 84, 0, 81, 0, 81, 0, 0, 79, 77, 0, 74, 0, 77, 0, 79, 0, 82, 0, 81, 0, 79, 0, 0, 0, 76, 0, 72, 0,
+      72, 0, 77, 0, 81, 0, 84, 0, 86, 0, 84, 0, 81, 0, 77, 0, 82, 0, 81, 0, 79, 0, 77, 0, 79, 0, 0, 0, 0, 0, 0, 0]},
+  ]};
+})();
+
+const PARTY = {
+  name: 'Party Park', col: '#ff4a4a', hues: [0, 50, 210, 120, 300],
+  items: [{k: 'star', c: '#ffd600'}, {k: 'balloon', c: '#e53935'}, {k: 'balloon', c: '#1e88e5'}, {k: 'heart', c: '#ff4f7b'}],
+  burst: [{k: 'star', n: 8, c: ['#ffd600', '#ffef6b'], gr: 0.6}, {k: 'confetti', n: 14, c: ['#e53935', '#ffd600', '#1e88e5', '#43a047']}, {k: 'heart', n: 4, c: ['#ff4f7b']}, {k: 'note', n: 2, c: ['#333333']}],
+  ring: '#fff59d', inst: 'xylo', scale: [67, 69, 71, 74, 76, 79, 81, 83, 86],
+  sfx(t, m) {
+    basePop(t); play('xylo', m, t, 0.4);
+    osc(sfxBus, 'sine', 180, t + 0.02, 0.28, 0.005, 0.38, {glide: 420, glideT: 0.12, vib: 16, vibAmt: 30});
+  },
+  init(st) {
+    st.sky = lin(0, 0, 0, H, [[0, '#5cc2ff'], [1, '#d6f2ff']]);
+    st.clouds = arr(4, () => ({x: rnd(0, W), y: rnd(H * 0.15, H * 0.35), s: S * rnd(0.04, 0.07), v: S * rnd(0.01, 0.025)}));
+    st.flowers = arr(18, () => ({x: rnd(0, W), y: rnd(H * 0.87, H * 0.98), c: pick(['#e53935', '#ffd600', '#ffffff', '#1e88e5', '#ff6fb5']), s: S * rnd(0.01, 0.017)}));
+    st.conf = arr(18, () => ({x: rnd(0, W), y: rnd(0, H), v: S * rnd(0.02, 0.05), p: rnd(0, TAU), c: pick(['#e53935', '#ffd600', '#1e88e5', '#43a047'])}));
+  },
+  draw(st, t, dt) {
+    g.fillStyle = st.sky; g.fillRect(0, 0, W, H);
+    const R0 = Math.min(W * 0.45, H * 0.55), lw = R0 * 0.07;
+    g.globalAlpha = 0.5; g.lineWidth = lw;
+    ['#ff4d4d', '#ff9f1c', '#ffe14d', '#5fd35f', '#4da6ff', '#9b6bff'].forEach((c, i) => {
+      g.strokeStyle = c; g.beginPath(); g.arc(W * 0.5, H * 0.8, R0 - i * lw, Math.PI, TAU); g.stroke();
+    });
+    g.globalAlpha = 1;
+    const sx = W * 0.84, sy = H * 0.24, sr = S * 0.065;
+    g.save(); g.translate(sx, sy); g.rotate(t * 0.3); g.fillStyle = '#ffd600';
+    for (let i = 0; i < 10; i++) { g.rotate(TAU / 10); g.beginPath(); g.moveTo(sr * 1.1, -sr * 0.18); g.lineTo(sr * 1.6, 0); g.lineTo(sr * 1.1, sr * 0.18); g.fill(); }
+    g.restore();
+    g.fillStyle = '#ffe14d'; circ(sx, sy, sr); g.fill();
+    g.fillStyle = '#333'; circ(sx - sr * 0.3, sy - sr * 0.15, sr * 0.1); g.fill(); circ(sx + sr * 0.3, sy - sr * 0.15, sr * 0.1); g.fill();
+    g.strokeStyle = '#333'; g.lineWidth = sr * 0.08; g.lineCap = 'round';
+    g.beginPath(); g.arc(sx, sy + sr * 0.05, sr * 0.38, 0.35, Math.PI - 0.35); g.stroke();
+    g.fillStyle = 'rgba(255,120,120,0.5)'; circ(sx - sr * 0.55, sy + sr * 0.2, sr * 0.13); g.fill(); circ(sx + sr * 0.55, sy + sr * 0.2, sr * 0.13); g.fill();
+    for (const c of st.clouds) { c.x += c.v * dt; if (c.x > W + c.s * 3) c.x = -c.s * 3; drawCloud(c.x, c.y, c.s); }
+    g.fillStyle = '#8be06a'; wavePath(H * 0.76, H * 0.03, 0.006, 1); g.fill();
+    g.fillStyle = '#55c246'; wavePath(H * 0.86, H * 0.025, 0.009, 3); g.fill();
+    for (const f of st.flowers) {
+      g.fillStyle = f.c;
+      for (let i = 0; i < 5; i++) { const a = i * TAU / 5; circ(f.x + Math.cos(a) * f.s, f.y + Math.sin(a) * f.s, f.s * 0.7); g.fill(); }
+      g.fillStyle = '#ffd600'; circ(f.x, f.y, f.s * 0.55); g.fill();
+    }
+    const bc = ['#e53935', '#ffd600', '#1e88e5', '#43a047'];
+    const n = Math.max(8, Math.round(W / (S * 0.09))), y0 = safe.t + S * 0.02, sag = S * 0.03;
+    g.strokeStyle = 'rgba(80,80,80,0.6)'; g.lineWidth = 1.5; g.beginPath();
+    for (let x = 0; x <= W; x += 10) { const y = y0 + sag * Math.sin(Math.PI * x / W); x ? g.lineTo(x, y) : g.moveTo(x, y); }
+    g.stroke();
+    for (let i = 0; i < n; i++) {
+      const x = (i + 0.5) * W / n, y = y0 + sag * Math.sin(Math.PI * x / W), w = W / n * 0.8;
+      g.save(); g.translate(x, y); g.rotate(Math.sin(t * 1.8 + i) * 0.08);
+      g.fillStyle = bc[i % 4]; g.beginPath(); g.moveTo(-w / 2, 0); g.lineTo(w / 2, 0); g.lineTo(0, w * 1.1); g.closePath(); g.fill();
+      g.restore();
+    }
+    for (const c of st.conf) {
+      c.y += c.v * dt; if (c.y > H + 10) { c.y = -10; c.x = rnd(0, W); }
+      g.save(); g.translate(c.x + Math.sin(t + c.p) * 10, c.y); g.rotate(t * 2 + c.p); g.scale(1, Math.cos(t * 3 + c.p));
+      g.fillStyle = c.c; g.fillRect(-4, -2.5, 8, 5); g.restore();
+    }
+  },
+};
+PARTY.music = (() => {
+  const G = [55, 59, 62], C = [48, 52, 55], D = [50, 54, 57];
+  const ch = [G, C, D, G, G, C, D, G];
+  return {step: 0.2, swing: 0.3, tracks: [
+    {i: 'tuba', v: 0.28, n: prog(ch, ['R', null, null, null, 'F', null, null, null])},
+    {i: 'uke', v: 0.09, n: prog(ch, [null, null, 'C', null, null, null, 'C', null], 12)},
+    {i: 'wood', v: 0.25, n: rep([0, 0, 1, 0, 0, 0, 1, 0], 8)},
+    {i: 'kick', v: 0.32, n: rep([1, 0, 0, 0, 1, 0, 0, 0], 8)},
+    {i: 'xylo', v: 0.22, n: [
+      67, 0, 71, 0, 74, 0, 71, 0, 72, 0, 76, 0, 79, 0, 76, 0, 74, 0, 78, 0, 81, 0, 78, 74, 79, 0, 0, 0, 0, 0, 67, 69,
+      71, 0, 74, 74, 0, 71, 0, 0, 72, 0, 76, 76, 0, 72, 0, 0, 74, 0, 78, 0, 81, 0, 84, 0, 83, 0, 79, 0, 0, 0, 0, 0]},
+  ]};
+})();
+
+const THEMES = [ICE, ISLAND, FIESTA, REEF, PARTY];
+const MENU_THEME = {inst: 'box', scale: [72, 74, 76, 79, 81, 84], burst: [{k: 'spark', n: 10, c: ['#ffffff', '#ffd6f5', '#d6e4ff']}], ring: '#ffffff'};
+const MENU_MUSIC = (() => {
+  const ch = [[60, 64, 67], [57, 60, 64], [53, 57, 60], [55, 59, 62]];
+  return {step: 0.34, tracks: [
+    {i: 'box', v: 0.12, n: prog(ch, [0, 2, 4, 2, 3, 2, 4, 2], 12)},
+    {i: 'bass', v: 0.14, n: prog(ch, ['R', null, null, null, 'F', null, null, null])},
+  ]};
+})();
+
+/* ---------------- GAME STATE ---------------- */
+let scene = 'menu', theme = null, T = 0;
+let bubbles = [], parts = [], freed = [], rings = [], events = [];
+let spawnT = 0, popCount = 0, rainbowT = 0, flashT = 0;
+let amb = {}, menuAmb = {}, menuBubs = [];
+const fade = {a: 0, dir: 0, cb: null};
+const hud = {home: {x: 0, y: 0, r: 0, hold: 0, pid: null}, mute: {x: 0, y: 0, r: 0, hold: 0, pid: null}};
+const HOLD = 1.1, CELEB_EVERY = 10;
+let started = false;
+
+function later(dt, fn) { events.push({t: T + dt, fn}); }
+
+function burst(th, x, y, r, mult = 1) {
+  for (const B of th.burst) {
+    const n = Math.round(B.n * mult);
+    for (let i = 0; i < n; i++) {
+      const a = rnd(0, TAU), sp = S * rnd(0.25, 0.75) * (B.sp || 1) * (0.7 + r / S);
+      parts.push({k: B.k, x: x + Math.cos(a) * r * 0.4, y: y + Math.sin(a) * r * 0.4, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+        gr: (B.gr || 0) * S * 0.9, life: 0, max: rnd(0.8, 1.5) * (B.life || 1), sz: S * rnd(0.012, 0.024) * (B.sz || 1),
+        rot: rnd(0, TAU), vr: rnd(-6, 6), c: pick(B.c), dir: Math.cos(a) > 0 ? 1 : -1});
+    }
+  }
+  if (parts.length > 600) parts.splice(0, parts.length - 600);
+}
+function freeItem(item, x, y, s) {
+  let vx = rnd(-0.1, 0.1) * S, vy = -S * 0.18, spin = rnd(-2, 2);
+  if (item.k === 'fish' || item.k === 'turtle') { vx = pick([-1, 1]) * S * 0.45; vy = -S * 0.04; spin = 0; }
+  else if (item.k === 'snowflake') { vy = S * 0.06; spin = 3; }
+  else if (item.k === 'balloon') { vy = -S * 0.35; spin = 0; }
+  freed.push({item, x, y, s, vx, vy, spin, rot: 0, life: 0, max: 1.8, dir: vx < 0 ? -1 : 1});
+  if (freed.length > 20) freed.shift();
+}
+function spawnBubble(onScreen) {
+  const golden = Math.random() < 0.07 && !bubbles.some(b => b.golden);
+  const r = S * rnd(0.1, 0.15) * (W * H > 500000 ? 0.9 : 1) * (golden ? 1.2 : 1);
+  const x0 = rnd(r + 10, W - r - 10);
+  bubbles.push({x: x0, x0, y: onScreen ? rnd(H * 0.35, H * 0.9) : H + r + rnd(0, 40), r, vy: -S * rnd(0.07, 0.13),
+    wa: rnd(8, S * 0.05), wf: rnd(0.6, 1.3), ph: rnd(0, TAU), hue: pick(theme.hues), item: pick(theme.items), golden, sc: onScreen ? 0.01 : 1});
+}
+function popBubble(i) {
+  const b = bubbles[i]; bubbles.splice(i, 1);
+  const th = theme;
+  burst(th, b.x, b.y, b.r, b.golden ? 2 : 1);
+  rings.push({x: b.x, y: b.y, r: b.r, life: 0, max: 0.5, c: th.ring});
+  freeItem(b.item, b.x, b.y, b.r * 0.5);
+  popSound(th, b.golden);
+  popCount++;
+  if (b.golden) { flashT = 0.25; celebrate(false); }
+  else if (popCount % CELEB_EVERY === 0) celebrate(true);
+}
+function celebrate(withSound) {
+  const th = theme;
+  if (withSound) fanfare(th);
+  rainbowT = 2.6;
+  for (let i = 0; i < 7; i++) later(0.12 + i * 0.14, () => {
+    if (theme !== th) return;
+    const x = rnd(W * 0.15, W * 0.85), y = rnd(H * 0.2, H * 0.65);
+    burst(th, x, y, S * 0.1, 1.4);
+    rings.push({x, y, r: S * 0.1, life: 0, max: 0.6, c: th.ring});
+    if (ac) th.sfx(ac.currentTime + 0.01, pick(th.scale));
+  });
+  const cc = ['#ff4d4d', '#ffd23f', '#4da6ff', '#5fd35f', '#ff6fb5', '#9b6bff'];
+  for (let i = 0; i < 60; i++) parts.push({k: 'confetti', x: rnd(0, W), y: rnd(-H * 0.3, 0), vx: rnd(-20, 20), vy: S * rnd(0.15, 0.35), gr: S * 0.05,
+    life: 0, max: rnd(2.5, 3.5), sz: S * rnd(0.012, 0.02), rot: rnd(0, TAU), vr: rnd(-6, 6), c: pick(cc), dir: 1, noDrag: true});
+}
+function tryPop(x, y) {
+  let best = -1, bd = 1e9;
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i], d = Math.hypot(x - b.x, y - b.y);
+    if (d < b.r * b.sc * 1.15 + 12 && d < bd) { best = i; bd = d; }
+  }
+  if (best >= 0) { popBubble(best); return true; }
+  return false;
+}
+function emptyTap(x, y, th) {
+  th = th || MENU_THEME;
+  const B = th.burst[th.burst.length - 1];
+  for (let i = 0; i < 8; i++) {
+    const a = rnd(0, TAU), sp = S * rnd(0.1, 0.3);
+    parts.push({k: 'spark', x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, gr: 0, life: 0, max: rnd(0.4, 0.8), sz: S * rnd(0.008, 0.014), rot: 0, vr: 0, c: pick(B.c), dir: 1});
+  }
+  rings.push({x, y, r: S * 0.03, life: 0, max: 0.4, c: 'rgba(255,255,255,0.8)'});
+  if (ac) play(th.inst, pick(th.scale), ac.currentTime + 0.005, 0.12);
+}
+
+/* --- scenes --- */
+function transition(cb) { if (fade.dir) return; fade.dir = 1; fade.cb = cb; }
+function startStage(th) {
+  transition(() => {
+    scene = 'play'; theme = th; amb = {}; th.init(amb);
+    bubbles = []; parts = []; freed = []; rings = []; events = []; popCount = 0; rainbowT = 0;
+    for (let i = 0; i < 4; i++) spawnBubble(true);
+    spawnT = 0.6; startMusic(th.music);
+  });
+}
+function goMenu() {
+  transition(() => {
+    scene = 'menu'; theme = null; bubbles = []; parts = []; freed = []; rings = []; events = []; rainbowT = 0;
+    layoutMenu(); startMusic(MENU_MUSIC);
+  });
+}
+function layoutMenu() {
+  menuAmb.sky = lin(0, 0, 0, H, [[0, '#ffc8e6'], [0.5, '#c8b6ff'], [1, '#9be7ff']]);
+  if (!menuAmb.bubs) menuAmb.bubs = arr(18, () => ({x: rnd(0, W), y: rnd(0, H), r: S * rnd(0.015, 0.04), v: S * rnd(0.04, 0.09), ph: rnd(0, TAU), hue: rnd(0, 360)}));
+  menuBubs = THEMES.map((th, i) => ({th, x: 0, y: 0, r: 0, ph: i * 1.3, gone: false}));
+  const usableTop = safe.t + H * 0.2;
+  if (W > H * 1.15) {
+    const r = Math.min(W / 11.5, H * 0.17), gap = W / 5;
+    menuBubs.forEach((m, i) => { m.r = r; m.x = gap * (i + 0.5); m.y = Math.max(usableTop + r, H * 0.55) + (i % 2 ? 1 : -1) * H * 0.07; });
+  } else {
+    const r = Math.min(W * 0.17, H * 0.085);
+    const pos = [[0.28, 0.30], [0.72, 0.39], [0.28, 0.54], [0.72, 0.63], [0.5, 0.82]];
+    menuBubs.forEach((m, i) => { m.r = r; m.x = W * pos[i][0]; m.y = H * pos[i][1]; });
+  }
+}
+function menuPop(m) {
+  m.gone = true;
+  burst(m.th, m.x, m.y, m.r, 1.5);
+  rings.push({x: m.x, y: m.y, r: m.r, life: 0, max: 0.5, c: m.th.ring});
+  popSound(m.th, false);
+  later(0.45, () => startStage(m.th));
+}
+
+/* ---------------- RENDER ---------------- */
+function drawBubble(x, y, r, hue, item, t, ph, golden, inner) {
+  const q = 0.035 * Math.sin(t * 3.2 + ph);
+  g.save(); g.translate(x, y);
+  if (golden) {
+    g.save(); g.globalCompositeOperation = 'lighter';
+    const gl = g.createRadialGradient(0, 0, r * 0.8, 0, 0, r * 1.6);
+    gl.addColorStop(0, 'rgba(255,220,110,0.55)'); gl.addColorStop(1, 'rgba(255,220,110,0)');
+    g.fillStyle = gl; circ(0, 0, r * 1.6); g.fill(); g.restore();
+  }
+  if (inner) { g.fillStyle = inner; circ(0, 0, r); g.fill(); }
+  if (item) { g.save(); g.translate(0, Math.sin(t * 2 + ph) * r * 0.05); drawItem(item, r * 0.5, t + ph); g.restore(); }
+  g.scale(1 + q, 1 - q);
+  const gr = g.createRadialGradient(-r * 0.3, -r * 0.35, r * 0.05, 0, 0, r);
+  gr.addColorStop(0, 'rgba(255,255,255,0.10)');
+  gr.addColorStop(0.7, `hsla(${hue},90%,75%,0.10)`);
+  gr.addColorStop(0.93, `hsla(${hue + 40},100%,80%,0.38)`);
+  gr.addColorStop(1, `hsla(${hue + 80},100%,90%,0.6)`);
+  g.fillStyle = gr; circ(0, 0, r); g.fill();
+  g.lineWidth = Math.max(2, r * 0.05);
+  const h0 = golden ? (t * 120) % 360 : hue + Math.sin(t + ph) * 30;
+  if (g.createConicGradient) {
+    const cg = g.createConicGradient(t * 0.6 + ph, 0, 0);
+    for (let i = 0; i <= 6; i++) cg.addColorStop(i / 6, `hsla(${(h0 + i * 60) % 360},100%,${golden ? 60 : 75}%,${golden ? 0.95 : 0.65})`);
+    g.strokeStyle = cg;
+  } else g.strokeStyle = `hsla(${h0},100%,80%,0.7)`;
+  circ(0, 0, r * 0.97); g.stroke();
+  g.fillStyle = 'rgba(255,255,255,0.8)'; g.beginPath(); g.ellipse(-r * 0.4, -r * 0.42, r * 0.22, r * 0.11, -0.75, 0, TAU); g.fill();
+  g.fillStyle = 'rgba(255,255,255,0.6)'; circ(-r * 0.12, -r * 0.62, r * 0.05); g.fill();
+  g.fillStyle = 'rgba(255,255,255,0.35)'; g.beginPath(); g.ellipse(r * 0.42, r * 0.42, r * 0.12, r * 0.05, -0.75, 0, TAU); g.fill();
+  g.restore();
+}
+function drawPart(p) {
+  const k = p.life / p.max, a = k < 0.7 ? 1 : 1 - (k - 0.7) / 0.3, s = p.sz;
+  if (p.k === 'spark') {
+    g.save(); g.globalCompositeOperation = 'lighter'; g.fillStyle = p.c;
+    g.globalAlpha = a * 0.3; circ(p.x, p.y, s * 2.2 * (1 - k * 0.5)); g.fill();
+    g.globalAlpha = a; circ(p.x, p.y, s * (1 - k * 0.5)); g.fill(); g.restore();
+    return;
+  }
+  g.save(); g.globalAlpha = a; g.translate(p.x, p.y);
+  switch (p.k) {
+    case 'flake': g.rotate(p.rot); drawSnowflake(s * 1.3, p.c, s * 0.25); break;
+    case 'petal': g.rotate(p.rot); g.fillStyle = p.c; g.beginPath(); g.ellipse(0, 0, s, s * 0.55, 0, 0, TAU); g.fill(); break;
+    case 'drop': g.rotate(Math.atan2(p.vy, p.vx) - Math.PI / 2); g.fillStyle = p.c;
+      g.beginPath(); g.arc(0, 0, s * 0.6, 0, Math.PI); g.lineTo(0, -s * 1.4); g.closePath(); g.fill(); break;
+    case 'confetti': g.rotate(p.rot); g.scale(1, Math.cos(p.rot * 2)); g.fillStyle = p.c; g.fillRect(-s * 0.6, -s * 0.35, s * 1.2, s * 0.7); break;
+    case 'star': g.rotate(p.rot); g.fillStyle = p.c; starPath(s, s * 0.45); g.fill(); break;
+    case 'heart': g.rotate(Math.sin(p.rot) * 0.3); g.fillStyle = p.c; heartPath(s); g.fill(); break;
+    case 'bubble': g.strokeStyle = 'rgba(255,255,255,0.85)'; g.lineWidth = 1.5; circ(0, 0, s * 0.7); g.stroke(); break;
+    case 'fish': drawFish(s * 1.3, p.c, p.c === '#ff7b25' ? '#fff' : null, p.dir, T + p.rot); break;
+    case 'note': g.rotate(Math.sin(p.rot) * 0.3); g.fillStyle = p.c; g.font = `bold ${s * 3}px ${FONT}`; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText('♪︎', 0, 0); break;
+  }
+  g.restore();
+}
+function drawRainbow(a) {
+  const R0 = Math.max(W, H) * 0.55, lw = R0 * 0.06;
+  g.save(); g.globalAlpha = a; g.lineWidth = lw;
+  ['#ff4d4d', '#ff9f1c', '#ffe14d', '#5fd35f', '#4da6ff', '#9b6bff'].forEach((c, i) => {
+    g.strokeStyle = c; g.beginPath(); g.arc(W / 2, H * 1.05, R0 - i * lw, Math.PI, TAU); g.stroke();
+  });
+  g.restore();
+}
+function drawHUD() {
+  const items = scene === 'play' ? ['home', 'mute'] : ['mute'];
+  for (const k of items) {
+    const b = hud[k];
+    g.save(); g.translate(b.x, b.y);
+    g.fillStyle = 'rgba(255,255,255,0.35)'; circ(0, 0, b.r); g.fill();
+    g.strokeStyle = 'rgba(255,255,255,0.8)'; g.lineWidth = 2; g.stroke();
+    g.fillStyle = '#fff'; g.strokeStyle = '#fff'; const s = b.r * 0.5;
+    if (k === 'home') {
+      g.beginPath(); g.moveTo(-s, 0); g.lineTo(0, -s); g.lineTo(s, 0); g.closePath(); g.fill();
+      g.fillRect(-s * 0.65, -s * 0.05, s * 1.3, s * 0.95);
+    } else {
+      g.beginPath(); g.moveTo(-s, -s * 0.35); g.lineTo(-s * 0.45, -s * 0.35); g.lineTo(s * 0.1, -s * 0.85); g.lineTo(s * 0.1, s * 0.85); g.lineTo(-s * 0.45, s * 0.35); g.lineTo(-s, s * 0.35); g.closePath(); g.fill();
+      g.lineWidth = s * 0.18; g.lineCap = 'round'; g.beginPath();
+      if (muted) { g.moveTo(s * 0.4, -s * 0.4); g.lineTo(s * 0.95, s * 0.4); g.moveTo(s * 0.95, -s * 0.4); g.lineTo(s * 0.4, s * 0.4); }
+      else { g.arc(s * 0.1, 0, s * 0.5, -0.8, 0.8); g.moveTo(s * 0.1 + Math.cos(-0.8) * s * 0.9, Math.sin(-0.8) * s * 0.9); g.arc(s * 0.1, 0, s * 0.9, -0.8, 0.8); }
+      g.stroke();
+    }
+    if (b.hold > 0) { g.strokeStyle = '#fff'; g.lineWidth = 5; g.lineCap = 'round'; g.beginPath(); g.arc(0, 0, b.r + 5, -Math.PI / 2, -Math.PI / 2 + TAU * Math.min(1, b.hold / HOLD)); g.stroke(); }
+    g.restore();
+  }
+  if (scene === 'play') {
+    const n = CELEB_EVERY, filled = popCount % n, avail = W - 2 * (hud.home.r * 2 + 40);
+    const sz = Math.min(S * 0.02, avail / (n * 2.6)), sp = sz * 2.6, x0 = W / 2 - sp * (n - 1) / 2;
+    for (let i = 0; i < n; i++) {
+      g.save(); g.translate(x0 + i * sp, hud.home.y);
+      starPath(sz, sz * 0.45);
+      if (i < filled) { g.fillStyle = '#ffd600'; g.fill(); }
+      else { g.fillStyle = 'rgba(255,255,255,0.25)'; g.fill(); }
+      g.strokeStyle = 'rgba(255,255,255,0.85)'; g.lineWidth = 1.5; g.stroke();
+      g.restore();
+    }
+  }
+}
+function drawMenu(t, dt) {
+  g.fillStyle = menuAmb.sky; g.fillRect(0, 0, W, H);
+  for (const b of menuAmb.bubs) {
+    b.y -= b.v * dt; if (b.y < -b.r * 2) { b.y = H + b.r * 2; b.x = rnd(0, W); }
+    drawBubble(b.x + Math.sin(t + b.ph) * 10, b.y, b.r, b.hue, null, t, b.ph, false, null);
+  }
+  const title = 'Bubble Pop!', fs = Math.min(S * 0.12, W * 0.1);
+  g.font = `bold ${fs}px ${FONT}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+  const tw = g.measureText(title).width; let x = W / 2 - tw / 2;
+  const cols = ['#ff4f7b', '#ff9f1c', '#ffd23f', '#4cd964', '#29b6f6', '#7b5cff'];
+  for (let i = 0; i < title.length; i++) {
+    const ch = title[i], w = g.measureText(ch).width, y = safe.t + H * 0.11 + Math.sin(t * 3 + i * 0.6) * fs * 0.08;
+    g.lineWidth = fs * 0.14; g.strokeStyle = '#fff'; g.lineJoin = 'round'; g.strokeText(ch, x + w / 2, y);
+    g.fillStyle = cols[i % cols.length]; g.fillText(ch, x + w / 2, y); x += w;
+  }
+  for (const m of menuBubs) {
+    if (m.gone) continue;
+    const y = m.y + Math.sin(t * 1.5 + m.ph) * S * 0.012;
+    const inner = g.createRadialGradient(m.x, y, m.r * 0.1, m.x, y, m.r);
+    inner.addColorStop(0, m.th.col + '55'); inner.addColorStop(1, m.th.col + 'cc');
+    g.save(); g.fillStyle = inner; circ(m.x, y, m.r); g.fill(); g.restore();
+    drawBubble(m.x, y, m.r, m.th.hues[0], m.th.items[0].k === 'snowflake' ? {k: 'snowman'} : m.th.items[0], t, m.ph, false, null);
+    const ls = Math.max(13, m.r * 0.22);
+    g.font = `bold ${ls}px ${FONT}`; g.lineWidth = ls * 0.25; g.strokeStyle = 'rgba(70,40,120,0.85)'; g.fillStyle = '#fff';
+    g.strokeText(m.th.name, m.x, y + m.r + ls * 0.9); g.fillText(m.th.name, m.x, y + m.r + ls * 0.9);
+  }
+  if (!started) {
+    g.font = `bold ${Math.max(14, S * 0.035)}px ${FONT}`; g.fillStyle = 'rgba(70,40,120,0.75)';
+    g.fillText('Tap a bubble to play', W / 2, H - safe.b - S * 0.05);
+  }
+}
+
+/* ---------------- LOOP ---------------- */
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now; T += dt;
+  try { update(dt); render(dt); } catch (e) { console.error(e); }
+  requestAnimationFrame(frame);
+}
+function update(dt) {
+  for (let i = events.length - 1; i >= 0; i--) if (T >= events[i].t) { const e = events[i]; events.splice(i, 1); e.fn(); }
+  for (const k in hud) {
+    const b = hud[k];
+    if (b.pid != null) {
+      b.hold += dt;
+      if (b.hold >= HOLD) {
+        b.pid = null; b.hold = 0;
+        if (k === 'home' && scene === 'play') goMenu();
+        if (k === 'mute') toggleMute();
+      }
+    }
+  }
+  if (fade.dir === 1) { fade.a += dt / 0.3; if (fade.a >= 1) { fade.a = 1; const cb = fade.cb; fade.cb = null; fade.dir = -1; cb && cb(); } }
+  else if (fade.dir === -1) { fade.a -= dt / 0.4; if (fade.a <= 0) { fade.a = 0; fade.dir = 0; } }
+  if (scene === 'play') {
+    const maxB = W * H > 500000 ? 9 : 6;
+    spawnT -= dt;
+    if (spawnT <= 0 && bubbles.length < maxB) { spawnBubble(false); spawnT = rnd(0.5, 1.1); }
+    for (let i = bubbles.length - 1; i >= 0; i--) {
+      const b = bubbles[i];
+      b.y += b.vy * dt; b.x = b.x0 + Math.sin(T * b.wf + b.ph) * b.wa;
+      if (b.sc < 1) b.sc = Math.min(1, b.sc + dt * 2.5);
+      if (b.y < -b.r - 10) bubbles.splice(i, 1);
+    }
+  }
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.life += dt; if (p.life >= p.max) { parts.splice(i, 1); continue; }
+    if (p.k === 'fish') { p.vy *= Math.pow(0.1, dt); p.vx = p.dir * S * 0.35; }
+    else if (!p.noDrag) { const d = Math.pow(0.3, dt); p.vx *= d; p.vy *= d; }
+    p.vy += p.gr * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.rot += p.vr * dt;
+  }
+  for (let i = freed.length - 1; i >= 0; i--) {
+    const f = freed[i]; f.life += dt; if (f.life >= f.max) { freed.splice(i, 1); continue; }
+    f.x += f.vx * dt; f.y += f.vy * dt; f.rot += f.spin * dt;
+  }
+  for (let i = rings.length - 1; i >= 0; i--) { rings[i].life += dt; if (rings[i].life >= rings[i].max) rings.splice(i, 1); }
+  if (rainbowT > 0) rainbowT -= dt;
+  if (flashT > 0) flashT -= dt;
+}
+function render(dt) {
+  if (scene === 'menu') drawMenu(T, dt);
+  else {
+    theme.draw(amb, T, dt);
+    if (rainbowT > 0) drawRainbow(Math.min(1, rainbowT, (2.6 - rainbowT) * 3) * 0.6);
+    for (const b of bubbles) drawBubble(b.x, b.y, b.r * b.sc, b.hue, b.item, T, b.ph, b.golden, null);
+  }
+  for (const f of freed) {
+    const k = f.life / f.max, sc = 1 + Math.min(k * 3, 1) * 0.35;
+    g.save(); g.globalAlpha = k > 0.6 ? 1 - (k - 0.6) / 0.4 : 1; g.translate(f.x, f.y);
+    if (f.item.k === 'fish' || f.item.k === 'turtle') { g.scale(f.dir, 1); g.translate(0, Math.sin(T * 6) * 3); }
+    else g.rotate(f.rot);
+    drawItem(f.item, f.s * sc, T); g.restore();
+  }
+  for (const r of rings) {
+    const k = r.life / r.max;
+    g.strokeStyle = r.c; g.globalAlpha = 1 - k; g.lineWidth = Math.max(1, r.r * 0.1 * (1 - k));
+    circ(r.x, r.y, r.r * (1 + k * 1.2)); g.stroke();
+  }
+  g.globalAlpha = 1;
+  for (const p of parts) drawPart(p);
+  drawHUD();
+  if (flashT > 0) { g.fillStyle = `rgba(255,255,240,${flashT * 1.6})`; g.fillRect(0, 0, W, H); }
+  if (fade.a > 0) { g.fillStyle = `rgba(255,255,255,${fade.a})`; g.fillRect(0, 0, W, H); }
+}
+
+/* ---------------- INPUT ---------------- */
+function toggleMute() {
+  muted = !muted;
+  try { localStorage.setItem('bp_muted', muted ? '1' : '0'); } catch (e) {}
+  if (ac) master.gain.setTargetAtTime(muted ? 0 : 0.9, ac.currentTime, 0.05);
+}
+let wakeLock = null;
+async function requestWakeLock() {
+  try { if ('wakeLock' in navigator && !document.hidden) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+}
+function firstTouch() {
+  initAudio();
+  if (!started) { started = true; startMusic(scene === 'menu' ? MENU_MUSIC : theme.music); requestWakeLock(); }
+}
+function onDown(x, y, pid) {
+  if (fade.dir) return;
+  for (const k of (scene === 'play' ? ['home', 'mute'] : ['mute'])) {
+    const b = hud[k];
+    if (Math.hypot(x - b.x, y - b.y) < b.r * 1.3) { b.pid = pid; b.hold = 0.0001; return; }
+  }
+  if (scene === 'menu') {
+    for (const m of menuBubs) {
+      const my = m.y + Math.sin(T * 1.5 + m.ph) * S * 0.012;
+      if (!m.gone && Math.hypot(x - m.x, y - my) < m.r * 1.12) { menuPop(m); return; }
+    }
+    emptyTap(x, y, null); return;
+  }
+  if (!tryPop(x, y)) emptyTap(x, y, theme);
+}
+const downs = new Set();
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault(); firstTouch(); downs.add(e.pointerId);
+  onDown(e.clientX, e.clientY, e.pointerId);
+}, {passive: false});
+cv.addEventListener('pointermove', e => {
+  if (!downs.has(e.pointerId) || scene !== 'play' || fade.dir) return;
+  for (const k in hud) if (hud[k].pid === e.pointerId) return;
+  tryPop(e.clientX, e.clientY);
+}, {passive: false});
+function up(e) {
+  downs.delete(e.pointerId);
+  for (const k in hud) if (hud[k].pid === e.pointerId) { hud[k].pid = null; hud[k].hold = 0; }
+}
+cv.addEventListener('pointerup', up); cv.addEventListener('pointercancel', up); cv.addEventListener('pointerleave', up);
+document.addEventListener('touchmove', e => e.preventDefault(), {passive: false});
+document.addEventListener('gesturestart', e => e.preventDefault());
+document.addEventListener('dblclick', e => e.preventDefault());
+document.addEventListener('contextmenu', e => e.preventDefault());
+document.addEventListener('visibilitychange', () => {
+  if (!ac) return;
+  if (document.hidden) ac.suspend(); else { ac.resume(); requestWakeLock(); }
+});
+
+/* ---------------- LAYOUT ---------------- */
+function readSafe() {
+  const cs = getComputedStyle(document.getElementById('sa'));
+  safe.t = parseFloat(cs.paddingTop) || 0; safe.r = parseFloat(cs.paddingRight) || 0;
+  safe.b = parseFloat(cs.paddingBottom) || 0; safe.l = parseFloat(cs.paddingLeft) || 0;
+}
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight; S = Math.min(W, H);
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  readSafe();
+  const r = clamp(S * 0.055, 22, 34);
+  hud.home.r = hud.mute.r = r;
+  hud.home.x = safe.l + r + 14; hud.home.y = hud.mute.y = safe.t + r + 14;
+  hud.mute.x = W - safe.r - r - 14;
+  menuAmb.bubs = null; layoutMenu();
+  if (scene === 'play' && theme) { amb = {}; theme.init(amb); for (const b of bubbles) b.x0 = clamp(b.x0, b.r, W - b.r); }
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 200));
+
+function makeIcon() {
+  const c = document.createElement('canvas'); c.width = c.height = 180;
+  const old = g; g = c.getContext('2d');
+  g.fillStyle = lin(0, 0, 0, 180, [[0, '#ffc8e6'], [0.5, '#c8b6ff'], [1, '#9be7ff']]); g.fillRect(0, 0, 180, 180);
+  drawBubble(90, 90, 66, 200, {k: 'star', c: '#ffd600'}, 0, 0, false, null);
+  document.getElementById('touchIcon').href = c.toDataURL('image/png');
+  g = old;
+}
+
+resize();
+makeIcon();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
